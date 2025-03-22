@@ -29,6 +29,25 @@ export async function updateUsdtBalance(newBalance) {
   await update(ref(ATRealDb, '/balance'), { usdt: newBalance });
 }
 
+async function storeOpenPosition(symbol, side, size, entryPrice, balance) {
+  await updatePosition(symbol, {
+    side,
+    size,
+    entryPrice,
+    updatedAt: Date.now(),
+  });
+  await updateUsdtBalance(balance);
+}
+
+async function closeStoredPosition(symbol) {
+  await updatePosition(symbol, {
+    side: '',
+    size: 0,
+    entryPrice: 0,
+    updatedAt: Date.now(),
+  });
+}
+
 function getSymbol(coin) {
   return coin.split('.')[0];
 }
@@ -73,12 +92,13 @@ const ProcessSignals = async (reqData) => {
   const balance = await getUsdtBalance();
 
   return {
-    status: 'ready',
+    status: 'state_loaded',
     symbol,
     requestedType: type,
     position,
     balance,
-    helpers: Boolean(futuresMarketBuy && futuresMarketSell && computeQty),
+    storage: Boolean(storeOpenPosition && closeStoredPosition),
+    exchange: Boolean(futuresMarketBuy && futuresMarketSell && computeQty),
   };
 };
 
