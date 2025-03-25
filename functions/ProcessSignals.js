@@ -91,14 +91,37 @@ const ProcessSignals = async (reqData) => {
   const position = await getPosition(symbol);
   const balance = await getUsdtBalance();
 
+  if (type !== 'buy' && type !== 'sell') {
+    return { status: 'error', message: `Unknown type: ${type}` };
+  }
+
+  if (position && position.side) {
+    return { status: 'skip_already_in_position', symbol, side: position.side };
+  }
+
+  const spendUsdt = balance * 0.25;
+  const quantity = await computeQty(spendUsdt, symbol);
+  if (quantity <= 0) {
+    return { status: 'skipped', reason: 'qty_too_small', symbol };
+  }
+
+  const order = type === 'buy'
+    ? await futuresMarketBuy(symbol, quantity)
+    : await futuresMarketSell(symbol, quantity);
+  const fillPrice = parseFloat(order?.fills?.[0]?.price || 0);
+  const cost = quantity * fillPrice;
+  const nextBalance = balance - cost;
+
+  await storeOpenPosition(symbol, type === 'buy' ? 'BUY' : 'SELL', quantity, fillPrice, nextBalance);
+
   return {
-    status: 'state_loaded',
+    status: 'success',
+    action: type,
     symbol,
-    requestedType: type,
-    position,
-    balance,
-    storage: Boolean(storeOpenPosition && closeStoredPosition),
-    exchange: Boolean(futuresMarketBuy && futuresMarketSell && computeQty),
+    quantity,
+    fillPrice,
+    cost,
+    balance: nextBalance,
   };
 };
 
