@@ -3,6 +3,7 @@ import dotenv from 'dotenv-esm';
 import { USDMClient } from 'binance';
 import { ATRealDb } from '../client.js';
 import { get, ref, update } from 'firebase/database';
+import { ADX, ATR, RSI } from 'technicalindicators';
 
 dotenv.config();
 
@@ -81,6 +82,25 @@ async function computeQty(spendUsdt, symbol) {
   return price > 0 ? spendUsdt / price : 0;
 }
 
+async function doubleValidate(symbol) {
+  try {
+    const candles = await client.getKlines({ symbol, interval: '5m', limit: 50 });
+    if (!candles || candles.length < 30) return false;
+
+    const high = candles.map((c) => parseFloat(c[2]));
+    const low = candles.map((c) => parseFloat(c[3]));
+    const close = candles.map((c) => parseFloat(c[4]));
+    const adx = ADX.calculate({ high, low, close, period: 14 }).pop()?.adx || 0;
+    const atr = ATR.calculate({ high, low, close, period: 14 }).pop() || 0;
+    const rsi = RSI.calculate({ values: close, period: 14 }).pop() || 0;
+
+    return adx > 20 && atr < 1000 && rsi > 35 && rsi < 65;
+  } catch (error) {
+    console.error(`[doubleValidate] ${symbol}: ${error.message}`);
+    return false;
+  }
+}
+
 const ProcessSignals = async (reqData) => {
   const { coin, type } = reqData || {};
   if (!coin || !type) {
@@ -90,6 +110,10 @@ const ProcessSignals = async (reqData) => {
   const symbol = getSymbol(coin);
   const position = await getPosition(symbol);
   const balance = await getUsdtBalance();
+
+  if (!(await doubleValidate(symbol))) {
+    return { status: 'skipped', reason: 'double_validation_failed', symbol };
+  }
 
   if (type !== 'buy' && type !== 'sell') {
     return { status: 'error', message: `Unknown type: ${type}` };
