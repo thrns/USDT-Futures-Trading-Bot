@@ -59,6 +59,21 @@ async function getLastPrice(symbol) {
   return parseFloat(priceInfo.price || '0');
 }
 
+async function getSymbolPrecision(symbol) {
+  const exchangeInfo = await client.getExchangeInfo();
+  const symbolInfo = exchangeInfo.symbols.find(
+    (item) => item.contractType === 'PERPETUAL' && item.symbol === symbol,
+  );
+  if (!symbolInfo) throw new Error(`Symbol ${symbol} not found in futures exchange info`);
+
+  const lotSize = symbolInfo.filters.find((item) => item.filterType === 'LOT_SIZE');
+  return {
+    quantityPrecision: symbolInfo.quantityPrecision,
+    minQty: parseFloat(lotSize.minQty),
+    stepSize: parseFloat(lotSize.stepSize),
+  };
+}
+
 async function futuresMarketBuy(symbol, quantity) {
   return client.submitNewOrder({
     symbol,
@@ -79,7 +94,14 @@ async function futuresMarketSell(symbol, quantity) {
 
 async function computeQty(spendUsdt, symbol) {
   const price = await getLastPrice(symbol);
-  return price > 0 ? spendUsdt / price : 0;
+  if (!price || price <= 0) return 0;
+
+  const { quantityPrecision, minQty, stepSize } = await getSymbolPrecision(symbol);
+  const rawQty = spendUsdt / price;
+  const adjustedQty = parseFloat(
+    (Math.floor(rawQty / stepSize) * stepSize).toFixed(quantityPrecision),
+  );
+  return adjustedQty >= minQty ? adjustedQty : 0;
 }
 
 async function doubleValidate(symbol) {
