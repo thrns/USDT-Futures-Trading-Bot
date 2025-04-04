@@ -1,11 +1,26 @@
 import { parentPort, workerData } from 'worker_threads';
 import dotenv from 'dotenv-esm';
 import { USDMClient } from 'binance';
+import nodemailer from 'nodemailer';
 import { ATRealDb } from '../client.js';
 import { get, ref, update } from 'firebase/database';
 import { ADX, ATR, RSI } from 'technicalindicators';
 
 dotenv.config();
+
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: { user: '', pass: '' },
+});
+
+async function sendEmail(subject, text) {
+  try {
+    const info = await transporter.sendMail({ from: '', to: '', subject, text });
+    console.log('[Email] Sent =>', info.messageId);
+  } catch (error) {
+    console.error('[Email] Error sending email:', error);
+  }
+}
 
 const client = new USDMClient({
   api_key: process.env.BINANCE_API_KEY,
@@ -133,7 +148,14 @@ const ProcessSignals = async (reqData) => {
   const position = await getPosition(symbol);
   const balance = await getUsdtBalance();
 
+  if (balance < 5) {
+    const message = `Balance is only ${balance}, too low for ${symbol}.`;
+    await sendEmail('Low Balance - Skipped Trade', message);
+    return { status: 'no_trade', reason: 'low_balance', symbol };
+  }
+
   if (!(await doubleValidate(symbol))) {
+    await sendEmail('Signal Validation Skipped', `Validation failed for ${symbol}.`);
     return { status: 'skipped', reason: 'double_validation_failed', symbol };
   }
 
@@ -159,6 +181,7 @@ const ProcessSignals = async (reqData) => {
   const nextBalance = balance - cost;
 
   await storeOpenPosition(symbol, type === 'buy' ? 'BUY' : 'SELL', quantity, fillPrice, nextBalance);
+  await sendEmail(`${type.toUpperCase()} - ${symbol}`, `Executed ${type} for ${symbol}: quantity=${quantity}, fillPrice=${fillPrice}`);
 
   return {
     status: 'success',
