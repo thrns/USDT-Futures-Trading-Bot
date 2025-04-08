@@ -119,6 +119,16 @@ async function computeQty(spendUsdt, symbol) {
   return adjustedQty >= minQty ? adjustedQty : 0;
 }
 
+async function submitForSide(symbol, side, quantity) {
+  return side === 'BUY'
+    ? futuresMarketBuy(symbol, quantity)
+    : futuresMarketSell(symbol, quantity);
+}
+
+async function fillPriceFrom(order) {
+  return parseFloat(order?.fills?.[0]?.price || 0);
+}
+
 async function doubleValidate(symbol) {
   try {
     const candles = await client.getKlines({ symbol, interval: '5m', limit: 50 });
@@ -154,44 +164,80 @@ const ProcessSignals = async (reqData) => {
     return { status: 'no_trade', reason: 'low_balance', symbol };
   }
 
-  if (!(await doubleValidate(symbol))) {
+  const validatedTypes = ['ENTER_BUY', 'ENTER_SELL', 'RE_BUY', 'RE_SELL'];
+  if (validatedTypes.includes(type) && !(await doubleValidate(symbol))) {
     await sendEmail('Signal Validation Skipped', `Validation failed for ${symbol}.`);
     return { status: 'skipped', reason: 'double_validation_failed', symbol };
   }
 
-  if (type !== 'buy' && type !== 'sell') {
-    return { status: 'error', message: `Unknown type: ${type}` };
+  switch (type) {
+    case 'ENTER_BUY':
+    case 'ENTER_SELL': {
+      if (position && position.side) {
+        return { status: 'skip_already_in_position', symbol, side: position.side };
+      }
+      const side = type === 'ENTER_BUY' ? 'BUY' : 'SELL';
+      const quantity = await computeQty(balance * 0.25, symbol);
+      if (quantity <= 0) return { status: 'skipped', reason: 'qty_too_small', symbol };
+
+      const order = await submitForSide(symbol, side, quantity);
+      const fillPrice = await fillPriceFrom(order);
+      const cost = quantity * fillPrice;
+      const nextBalance = balance - cost;
+      await storeOpenPosition(symbol, side, quantity, fillPrice, nextBalance);
+      await sendEmail(`${type} - ${symbol}`, `Executed ${type}: quantity=${quantity}, fillPrice=${fillPrice}`);
+      return { status: 'success', action: type, quantity, fillPrice, cost, nextBalance };
+    }
+
+    case 'TP_BUY':
+    case 'TP_SELL': {
+      const side = type === 'TP_BUY' ? 'BUY' : 'SELL';
+      if (position.side !== side || position.size <= 0) return { status: `no_${side.toLowerCase()}_position` };
+      const partialQty = position.size * 0.25;
+      if (partialQty <= 0) return { status: 'skipped', reason: 'qty_too_small' };
+      const order = await submitForSide(symbol, side === 'BUY' ? 'SELL' : 'BUY', partialQty);
+      const fillPrice = await fillPriceFrom(order);
+      const proceeds = partialQty * fillPrice;
+      const newSize = position.size - partialQty;
+      await updateUsdtBalance(balance + proceeds);
+      await updatePosition(symbol, { size: newSize, updatedAt: Date.now() });
+      await sendEmail(`${type} - ${symbol}`, `Partial take profit: quantity=${partialQty}, fillPrice=${fillPrice}`);
+      return { status: 'partial_take_profit', partialQty, fillPrice, newSize };
+    }
+
+    case 'RE_BUY':
+    case 'RE_SELL': {
+      const side = type === 'RE_BUY' ? 'BUY' : 'SELL';
+      if (position.side !== side || position.size <= 0) return { status: `no_${side.toLowerCase()}_position` };
+      const quantity = await computeQty(balance * 0.25, symbol);
+      if (quantity <= 0) return { status: 'skipped', reason: 'qty_too_small' };
+      const order = await submitForSide(symbol, side, quantity);
+      const fillPrice = await fillPriceFrom(order);
+      const cost = quantity * fillPrice;
+      const newSize = position.size + quantity;
+      await updateUsdtBalance(balance - cost);
+      await updatePosition(symbol, { size: newSize, updatedAt: Date.now() });
+      await sendEmail(`${type} - ${symbol}`, `Re-entry quantity=${quantity}, fillPrice=${fillPrice}`);
+      return { status: 're_entry', quantity, fillPrice, newSize };
+    }
+
+    case 'EXIT_BUY':
+    case 'EXIT_SELL': {
+      const side = type === 'EXIT_BUY' ? 'BUY' : 'SELL';
+      if (position.side !== side || position.size <= 0) return { status: `no_${side.toLowerCase()}_position` };
+      const closeQty = position.size;
+      const order = await submitForSide(symbol, side === 'BUY' ? 'SELL' : 'BUY', closeQty);
+      const fillPrice = await fillPriceFrom(order);
+      const proceeds = closeQty * fillPrice;
+      await updateUsdtBalance(balance + proceeds);
+      await closeStoredPosition(symbol);
+      await sendEmail(`${type} - ${symbol}`, `Exited ${side}: quantity=${closeQty}, fillPrice=${fillPrice}`);
+      return { status: `exited_${side.toLowerCase()}`, closeQty, fillPrice, proceeds };
+    }
+
+    default:
+      return { status: 'error', message: `Unknown type: ${type}` };
   }
-
-  if (position && position.side) {
-    return { status: 'skip_already_in_position', symbol, side: position.side };
-  }
-
-  const spendUsdt = balance * 0.25;
-  const quantity = await computeQty(spendUsdt, symbol);
-  if (quantity <= 0) {
-    return { status: 'skipped', reason: 'qty_too_small', symbol };
-  }
-
-  const order = type === 'buy'
-    ? await futuresMarketBuy(symbol, quantity)
-    : await futuresMarketSell(symbol, quantity);
-  const fillPrice = parseFloat(order?.fills?.[0]?.price || 0);
-  const cost = quantity * fillPrice;
-  const nextBalance = balance - cost;
-
-  await storeOpenPosition(symbol, type === 'buy' ? 'BUY' : 'SELL', quantity, fillPrice, nextBalance);
-  await sendEmail(`${type.toUpperCase()} - ${symbol}`, `Executed ${type} for ${symbol}: quantity=${quantity}, fillPrice=${fillPrice}`);
-
-  return {
-    status: 'success',
-    action: type,
-    symbol,
-    quantity,
-    fillPrice,
-    cost,
-    balance: nextBalance,
-  };
 };
 
 if (parentPort) {
