@@ -3,7 +3,7 @@ import dotenv from 'dotenv-esm';
 import { USDMClient } from 'binance';
 import nodemailer from 'nodemailer';
 import { ATRealDb } from '../client.js';
-import { get, ref, update } from 'firebase/database';
+import { get, ref, update, remove } from 'firebase/database';
 import { ADX, ATR, RSI } from 'technicalindicators';
 
 dotenv.config();
@@ -55,13 +55,13 @@ async function storeOpenPosition(symbol, side, size, entryPrice, balance) {
   await updateUsdtBalance(balance);
 }
 
-async function closeStoredPosition(symbol) {
-  await updatePosition(symbol, {
-    side: '',
-    size: 0,
-    entryPrice: 0,
-    updatedAt: Date.now(),
+async function moveToPastPositions(symbol, position) {
+  const timestamp = Date.now();
+  await update(ref(ATRealDb, `/past_positions/${symbol}/${timestamp}`), {
+    ...position,
+    closedAt: timestamp,
   });
+  await remove(ref(ATRealDb, `/positions/${symbol}`));
 }
 
 function getSymbol(coin) {
@@ -230,9 +230,17 @@ const ProcessSignals = async (reqData) => {
       const fillPrice = await fillPriceFrom(order);
       const proceeds = closeQty * fillPrice;
       await updateUsdtBalance(balance + proceeds);
-      await closeStoredPosition(symbol);
+      const realizedPnL = side === 'BUY'
+        ? (fillPrice - position.entryPrice) * closeQty
+        : (position.entryPrice - fillPrice) * closeQty;
+      await moveToPastPositions(symbol, {
+        ...position,
+        exitPrice: fillPrice,
+        proceeds,
+        realizedPnL,
+      });
       await sendEmail(`${type} - ${symbol}`, `Exited ${side}: quantity=${closeQty}, fillPrice=${fillPrice}`);
-      return { status: `exited_${side.toLowerCase()}`, closeQty, fillPrice, proceeds };
+      return { status: `exited_${side.toLowerCase()}`, closeQty, fillPrice, proceeds, realizedPnL };
     }
 
     default:
