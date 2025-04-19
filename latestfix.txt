@@ -1,0 +1,722 @@
+lis of changes to be made
+1) When a position is active, update to firebase real time db under node "atheeb" -> "positions"
+2) if position is closed, remove the position from "positions" and add it under "past_positions" under node "atheeb"
+3) there will be only two types "buy" or "sell" from the post request
+4) If type is "sell" for a symbol and the status for that symbol is "buy" and is already active in "positions" (firebase rtdb) then close the active position in binance(also deleting from "positions") and shift it to past_positions node. else open a new short trade 
+5) similarly, if the type is "buy".
+
+/*******************************************************************************************
+ * ProcessSignals.worker.js
+ *
+ * - Handles 8 TTR signals explicitly: ENTER_BUY, ENTER_SELL, EXIT_BUY, EXIT_SELL,
+ *   TP_BUY, TP_SELL, RE_BUY, RE_SELL.
+ * - Trades on Binance USDT Futures (using @tiagosiebler/binance / 'binance' package).
+ * - Takes 25% partial TPs on each TP signal.
+ * - Reverses a position on RE signals if double validation passes.
+ * - If balance is too low, emails you that the trade was skipped.
+ * - Emails on each action (partial TP, enters, exits, reversals).
+ *******************************************************************************************/
+
+import { parentPort, workerData } from "worker_threads";
+import dotenv from "dotenv-esm";
+import { MainClient, USDMClient } from "binance";
+import nodemailer from "nodemailer";
+import { ATRealDb } from "../client.js";
+import { getDatabase, ref, get, update } from "firebase/database";
+
+// Indicators
+import { ADX, ATR, RSI } from "technicalindicators";
+
+dotenv.config();
+
+// -------------------------------------------------------------------------------------
+// 1) Hard-coded thresholds & config
+// -------------------------------------------------------------------------------------
+const ADX_THRESHOLD = 20; // Allow weaker trends for short-term trades
+const ATR_MAX = 1000; // Looser volatility constraint
+const RSI_LOWER = 35; // Oversold
+const RSI_UPPER = 65; // Overbought
+const QUOTE_ASSET = "USDT";
+
+// Partial TP fraction (25%)
+const PARTIAL_TP_FRACTION = 0.25;
+
+// Stop Loss multiple (example: 2 × ATR)
+const STOP_LOSS_MULTIPLIER = 2;
+
+// -------------------------------------------------------------------------------------
+// 2) Instantiate binance client for USDT Futures
+// -------------------------------------------------------------------------------------
+
+console.log("process.env.BINANCE_API_KEY: ", process.env.BINANCE_API_KEY);
+console.log("process.env.BINANCE_API_SECRET: ", process.env.BINANCE_API_SECRET);
+
+const client = new USDMClient({
+  api_key: process.env.BINANCE_API_KEY,
+  api_secret: process.env.BINANCE_API_SECRET,
+});
+
+// client.getBalance()
+//   .then((result) => {
+//     console.log('getBalance result: ', result);
+//   })
+//   .catch((err) => {
+//     console.error('getBalance error: ', err);
+//   });
+
+// -------------------------------------------------------------------------------------
+// 3) Nodemailer Setup
+// -------------------------------------------------------------------------------------
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: "atheebvalued@gmail.com",
+    pass: "qfmt lssy znla rsak",
+  },
+});
+
+async function sendEmail(subject, text) {
+  try {
+    const info = await transporter.sendMail({
+      from: `atheebvalued@gmail.com`,
+      to: "atheebvalued@gmail.com",
+      // cc: "sv.tharunpranav@gmail.com",
+      subject,
+      text,
+    });
+    console.log("[Email] Sent =>", info.messageId);
+  } catch (err) {
+    console.error("[Email] Error sending email:", err);
+  }
+}
+
+// -------------------------------------------------------------------------------------
+// 4) Firebase Helpers (Updated for "Atheeb" user)
+// -------------------------------------------------------------------------------------
+
+export async function getPosition(coin) {
+  const positionRef = ref(ATRealDb, `atheeb/positions/${coin}`);
+  const snapshot = await get(positionRef);
+  return snapshot.exists() ? snapshot.val() : {};
+}
+
+export async function updatePosition(coin, data) {
+  const positionRef = ref(ATRealDb, `atheeb/positions/${coin}`);
+  await update(positionRef, data);
+}
+
+export async function getUsdtBalance() {
+  const balanceRef = ref(ATRealDb, "atheeb/balance/usdt");
+  const snapshot = await get(balanceRef);
+  return snapshot.exists() ? parseFloat(snapshot.val()) : 0;
+}
+
+export async function updateUsdtBalance(newBalance) {
+  const balanceRef = ref(ATRealDb, "atheeb/balance");
+  await update(balanceRef, { usdt: newBalance });
+}
+
+async function moveToPastPositions(coin, position) {
+  const pastPositionsRef = ref(
+    ATRealDb,
+    `atheeb/pastPositions/${coin}/${Date.now()}`
+  );
+  const positionRef = ref(ATRealDb, `atheeb/positions/${coin}`);
+
+  try {
+    // Add the current position to pastPositions
+    await update(pastPositionsRef, {
+      ...position,
+      closedAt: Date.now(), // Add a timestamp for when the position was closed
+    });
+
+    // Remove the current position from the positions node
+    await update(positionRef, null);
+
+    console.log(
+      `[moveToPastPositions] Moved ${coin} position to pastPositions.`
+    );
+  } catch (err) {
+    console.error(`[moveToPastPositions] Error for ${coin}: ${err.message}`);
+    throw err;
+  }
+}
+
+// -------------------------------------------------------------------------------------
+// 5) Binance Futures Trading Helpers
+// -------------------------------------------------------------------------------------
+function getSymbol(coin) {
+  console.log("${coin.split('.')[0]} :", `${coin.split(".")[0]}`);
+  return `${coin.split(".")[0]}`;
+}
+
+async function futuresMarketBuy(symbol, quantity) {
+  try {
+    console.log("BUYING ", symbol, " QTY ", String(quantity.toFixed(2)));
+
+    const response = await client.submitNewOrder({
+      symbol, // Symbol for the trade (e.g., BTCUSDT)
+      side: "BUY", // Order side (BUY)
+      type: "MARKET", // Order type (MARKET)
+      quantity: String(quantity.toFixed(2)), // Quantity to buy as a string
+    });
+    console.log(`Market Buy Order Submitted: ${JSON.stringify(response)}`);
+    return response; // Return the API response
+  } catch (error) {
+    console.error(`Error placing market buy order: ${error.message}`);
+    throw error;
+  }
+}
+
+async function futuresMarketSell(symbol, quantity) {
+  try {
+    console.log("SELLING ", symbol, " QTY ", String(quantity.toFixed(2)));
+    const response = await client.submitNewOrder({
+      symbol, // Symbol for the trade (e.g., BTCUSDT)
+      side: "SELL", // Order side (SELL)
+      type: "MARKET", // Order type (MARKET)
+      quantity: String(quantity.toFixed(1)), // Quantity to sell as a string
+    });
+    console.log(`Market Sell Order Submitted: ${JSON.stringify(response)}`);
+    return response; // Return the API response
+  } catch (error) {
+    console.error(`Error placing market sell order: ${error.message}`);
+    throw error;
+  }
+}
+
+async function getLastPrice(symbol) {
+  // returns float price
+  const ticker = await client.getSymbolPriceTicker({ symbol });
+  const priceInfo = Array.isArray(ticker) ? ticker[0] : ticker;
+  return parseFloat(priceInfo.price || "0");
+}
+
+// -------------------------------------------------------------------------------------
+// 6) Double Validation
+// -------------------------------------------------------------------------------------
+async function doubleValidate(coin) {
+  try {
+    const symbol = getSymbol(coin);
+    const candles = await client.getKlines({
+      symbol,
+      interval: "5m",
+      limit: 50,
+    });
+
+    if (!candles || candles.length < 30) {
+      const msg = `Double Validation Failed: Not enough 5m candles for ${symbol}.`;
+      console.log(msg);
+      return false;
+    }
+
+    // Build arrays for open, high, low, close
+    const highArray = candles.map((c) => parseFloat(c[2]));
+    const lowArray = candles.map((c) => parseFloat(c[3]));
+    const closeArray = candles.map((c) => parseFloat(c[4]));
+
+    // ADX
+    const adxValue =
+      ADX.calculate({
+        high: highArray,
+        low: lowArray,
+        close: closeArray,
+        period: 14,
+      }).pop()?.adx || 0;
+
+    // ATR
+    const atrValue =
+      ATR.calculate({
+        high: highArray,
+        low: lowArray,
+        close: closeArray,
+        period: 14,
+      }).pop() || 0;
+
+    // RSI
+    const rsiValue =
+      RSI.calculate({ values: closeArray, period: 14 }).pop() || 0;
+
+    // Relaxed conditions
+    const adxOk = adxValue > ADX_THRESHOLD;
+    const atrOk = atrValue < ATR_MAX;
+    const rsiOk = rsiValue > RSI_LOWER && rsiValue < RSI_UPPER;
+
+    if (adxOk && atrOk && rsiOk) {
+      console.log(`[Validation Passed] ${symbol}`);
+      return true;
+    }
+    console.log(
+      `[Validation] ${symbol}: ADX=${adxValue}, ATR=${atrValue}, RSI=${rsiValue}`
+    );
+    const reasons = [];
+    if (!adxOk) reasons.push(`ADX=${adxValue} below ${ADX_THRESHOLD}`);
+    if (!atrOk) reasons.push(`ATR=${atrValue} exceeds ${ATR_MAX}`);
+    if (!rsiOk)
+      reasons.push(`RSI=${rsiValue} out of range (${RSI_LOWER}-${RSI_UPPER})`);
+
+    console.log(`[Validation Failed] ${symbol}: ${reasons.join(", ")}`);
+    return false;
+  } catch (err) {
+    console.error(`[Validation Error] ${coin}: ${err.message}`);
+    return false;
+  }
+}
+
+// -------------------------------------------------------------------------------------
+// 6) MARKET TREND Validation
+// Helper function to determine trend based on moving averages or indicators
+// -------------------------------------------------------------------------------------
+async function getMarketTrend(symbol, interval = "5m") {
+  try {
+    const candles = await client.getKlines({
+      symbol,
+      interval,
+      limit: 50,
+    });
+
+    if (!candles || candles.length < 20) {
+      console.error(`[getMarketTrend] Not enough candles for ${symbol}`);
+      return "neutral"; // Default to neutral if insufficient data
+    }
+
+    const closePrices = candles.map((c) => parseFloat(c[4]));
+    const shortSMA = closePrices.slice(-5).reduce((a, b) => a + b, 0) / 5; // 5-period SMA
+    const longSMA = closePrices.slice(-20).reduce((a, b) => a + b, 0) / 20; // 20-period SMA
+
+    if (shortSMA > longSMA) return "bullish";
+    if (shortSMA < longSMA) return "bearish";
+    return "neutral";
+  } catch (err) {
+    console.error(`[getMarketTrend] Error for ${symbol}: ${err.message}`);
+    return "neutral";
+  }
+}
+
+// -------------------------------------------------------------------------------------
+// 7) Main: ProcessSignals
+//     We handle these 8 signals from TTR:
+//       ENTER_BUY, ENTER_SELL, EXIT_BUY, EXIT_SELL, TP_BUY, TP_SELL, RE_BUY, RE_SELL
+// -------------------------------------------------------------------------------------
+const ProcessSignals = async (reqData) => {
+  try {
+    const { coin, type } = reqData;
+    // e.g. type = "TP_SELL", refinedCoin = "XRP"
+    const refinedCoin = coin.split(".")[0];
+
+    if (!refinedCoin || !type) {
+      const msg = "ProcessSignals Error: Missing coin or type in workerData.";
+      console.error(msg);
+      await sendEmail("ProcessSignals Data Error", msg);
+      throw new Error(msg);
+    }
+
+    // 1) For signals that involve opening or reversing, do double validation
+    //    We'll do double validation for ENTER & RE signals.
+    //    (If you want to do it for EXIT or TP, adapt as needed.)
+    const signalsNeedingValidation = [
+      "ENTER_BUY",
+      "ENTER_SELL",
+      "RE_BUY",
+      "RE_SELL",
+    ];
+    if (signalsNeedingValidation.includes(type)) {
+      const isValid = await doubleValidate(refinedCoin);
+      if (!isValid) {
+        const msg = `Double Validation failed for signal: ${type}, coin: ${refinedCoin}. Action skipped.`;
+        console.log(msg);
+        await sendEmail("Signal Validation Skipped", msg);
+        return {
+          status: "skipped",
+          reason: "double_validation_failed",
+          refinedCoin,
+          type,
+        };
+      }
+    }
+
+    // 2) Let's get the position
+    const position = await getPosition(refinedCoin);
+    const symbol = getSymbol(refinedCoin);
+
+    // 3) Check our USDT Balance
+    const usdtBal = await getUsdtBalance();
+
+    // --------------------------------------------------------------
+    // CASES:
+    // ENTER_BUY  => open a new LONG with 25% of USDT
+    // ENTER_SELL => open a new SHORT with 25% of USDT
+    // EXIT_BUY   => if we hold a LONG, close it fully
+    // EXIT_SELL  => if we hold a SHORT, close it fully
+    // TP_BUY     => partial TP (25%) if side=BUY
+    // TP_SELL    => partial TP (25%) if side=SELL
+    // RE_BUY     => if side=SELL, close it & open new BUY
+    // RE_SELL    => if side=BUY,  close it & open new SELL
+    // --------------------------------------------------------------
+
+    async function getSymbolPrecision(symbol) {
+      try {
+        if (!symbol) {
+          throw new Error("Symbol is undefined or null");
+        }
+        console.log("Fetching precision for symbol:", symbol);
+
+        const exchangeInfo = await client.getExchangeInfo();
+        console.log("Exchange info received");
+
+        // Filter for futures symbols
+        const futuresSymbols = exchangeInfo.symbols.filter(
+          (s) => s.contractType === "PERPETUAL"
+        );
+        console.log("Filtered Futures Symbols: ", futuresSymbols);
+
+        // Find the specific symbol in futures symbols
+        const symbolInfo = futuresSymbols.find((s) => s.symbol === symbol);
+        if (!symbolInfo) {
+          throw new Error(
+            `Symbol ${symbol} not found in futures exchange info`
+          );
+        }
+
+        console.log("symbolInfo,: ", symbolInfo);
+
+        console.log("quantityPrecision,: ", symbolInfo.quantityPrecision);
+        console.log("pricePrecision: ", symbolInfo.pricePrecision);
+
+        return {
+          quantityPrecision: symbolInfo.quantityPrecision,
+          pricePrecision: symbolInfo.pricePrecision,
+        };
+      } catch (err) {
+        console.error(`Error fetching precision for ${symbol}: ${err.message}`);
+        throw err;
+      }
+    }
+
+    async function computeQty(spendUsdt, symbol) {
+      const leverage = 30; // Define leverage multiplier
+
+      const lastPrice = await getLastPrice(symbol);
+
+      if (!lastPrice || lastPrice <= 0) {
+        console.error(`[computeQty] Invalid last price: ${lastPrice}`);
+        return 0;
+      }
+
+      const { quantityPrecision } = await getSymbolPrecision(symbol);
+      console.log("quantityPrecision: ", quantityPrecision);
+      console.log("spendUsdt: ", spendUsdt);
+      console.log("lastPrice: ", lastPrice);
+
+      // Adjust spendUsdt by leverage
+      const effectiveUsdt = spendUsdt * leverage;
+      console.log("Effective USDT with leverage: ", effectiveUsdt);
+
+      const rawQty = effectiveUsdt / lastPrice;
+
+      // Fetch symbol filters for validation
+      const exchangeInfo = await client.getExchangeInfo();
+      const futuresSymbol = exchangeInfo.symbols.find(
+        (s) => s.symbol === symbol
+      );
+      const lotSizeFilter = futuresSymbol.filters.find(
+        (f) => f.filterType === "LOT_SIZE"
+      );
+      const minNotionalFilter = futuresSymbol.filters.find(
+        (f) => f.filterType === "MIN_NOTIONAL"
+      );
+
+      const minQty = parseFloat(lotSizeFilter.minQty);
+      const stepSize = parseFloat(lotSizeFilter.stepSize);
+      const minNotional = parseFloat(minNotionalFilter.notional);
+
+      console.log(
+        `minQty: ${minQty}, stepSize: ${stepSize}, minNotional: ${minNotional}`
+      );
+
+      // Ensure the quantity respects the precision and step size
+      const adjustedQty =
+        quantityPrecision === 0
+          ? Math.floor(rawQty)
+          : parseFloat(
+              (rawQty - (rawQty % stepSize)).toFixed(quantityPrecision)
+            );
+
+      // Validate against minQty and minNotional
+      if (adjustedQty < minQty) {
+        console.error(
+          `[computeQty] Quantity too small: adjustedQty=${adjustedQty}, notional=${
+            (adjustedQty * lastPrice) / leverage
+          } < ${minNotional}`
+        );
+        return 0;
+      }
+
+      console.log(
+        `[computeQty] Valid quantity: ${adjustedQty}, notional=${
+          (adjustedQty * lastPrice) / leverage
+        }`
+      );
+      return adjustedQty;
+    }
+
+    switch (type) {
+      // ----------------------------------------
+      // ENTER_BUY
+      // ----------------------------------------
+      case "buy": {
+        // Handle exiting a short position
+        if (position.side === "SELL" && position.size > 0) {
+          const marketTrend = await getMarketTrend(symbol, "5m");
+          if (marketTrend === "bullish") {
+            const closeQty = position.size;
+            console.log(
+              `[BUY] Bullish trend detected. Closing short position for ${refinedCoin}. Qty=${closeQty}`
+            );
+            const closeResult = await futuresMarketBuy(symbol, closeQty);
+
+            let fillPrice = 0;
+            if (closeResult?.fills?.length) {
+              fillPrice = parseFloat(closeResult.fills[0].price) || 0;
+            }
+            const proceeds = closeQty * fillPrice;
+
+            const currentBal = await getUsdtBalance();
+            const updatedBal = currentBal + proceeds;
+            await updateUsdtBalance(updatedBal);
+
+            // Move to pastPositions before clearing current position
+            await moveToPastPositions(refinedCoin, {
+              ...position,
+              proceeds,
+              exitPrice: fillPrice,
+            });
+
+            await updatePosition(refinedCoin, {
+              side: "",
+              size: 0,
+              entryPrice: 0,
+              updatedAt: Date.now(),
+            });
+
+            const emailMsg = `EXIT_SELL for ${refinedCoin} due to bullish trend:
+            - Closed Short Qty: ${closeQty}
+            - Fill Price: ${fillPrice}
+            - Proceeds: ${proceeds}
+            - Updated USDT Balance: ${updatedBal}`;
+            await sendEmail(`EXIT_SELL - ${refinedCoin}`, emailMsg);
+
+            return {
+              status: "exited_sell_due_to_trend",
+              closeQty,
+              fillPrice,
+              proceeds,
+              updatedBal,
+            };
+          }
+        }
+
+        if (position.side && position.side !== "") {
+          const msg = `[ENTER_BUY] Already in a position: side=${position.side}. Skipping new BUY.`;
+          console.log(msg);
+          await sendEmail("Skipped ENTER_BUY", msg);
+          return { status: "skip_already_in_position" };
+        }
+
+        // Normal buy logic
+        if (usdtBal < 5) {
+          const msg = `[ENTER_BUY] Balance is only ${usdtBal}, too low for ${refinedCoin}.`;
+          console.log(msg);
+          await sendEmail("Low Balance - Skipped ENTER_BUY", msg);
+          return { status: "no_trade", reason: "low_balance", usdtBal };
+        }
+
+        const spendUsdt = usdtBal * 0.25;
+        const qty = await computeQty(spendUsdt, coin.split(".")[0]);
+        if (qty < 0.0001) {
+          const msg = `[ENTER_BUY] Computed quantity ${qty} is too small for ${refinedCoin}.`;
+          console.log(msg);
+          await sendEmail("Qty Too Small - Skipped ENTER_BUY", msg);
+          return { status: "skipped", reason: "qty_too_small" };
+        }
+
+        console.log(
+          `[ENTER_BUY] => symbol: ${symbol}, spend ~${spendUsdt}, qty=${qty}`
+        );
+        const buyResult = await futuresMarketBuy(symbol, qty);
+
+        let fillPrice = 0;
+        if (buyResult?.fills?.length) {
+          fillPrice = parseFloat(buyResult.fills[0].price) || 0;
+        }
+        const costUsdt = qty * fillPrice;
+        const newBal = usdtBal - costUsdt;
+        await updateUsdtBalance(newBal);
+
+
+
+        await updatePosition(refinedCoin, {
+          side: "BUY",
+          size: qty,
+          entryPrice: fillPrice,
+          updatedAt: Date.now(),
+        });
+
+        const emailMsg = `ENTER_BUY executed for ${refinedCoin}:
+        - Quantity: ${qty}
+        - Fill Price: ${fillPrice}
+        - Cost: ${costUsdt}
+        - Updated USDT Balance: ${newBal}`;
+        await sendEmail(`ENTER_BUY - ${refinedCoin}`, emailMsg);
+
+        return {
+          status: "success",
+          action: "ENTER_BUY",
+          qty,
+          fillPrice,
+          costUsdt,
+          newBal,
+        };
+      }
+
+      // ----------------------------------------
+      // ENTER_SELL
+      // ----------------------------------------
+      case "sell": {
+        // Handle exiting a long position
+        if (position.side === "BUY" && position.size > 0) {
+          const marketTrend = await getMarketTrend(symbol, "5m");
+          if (marketTrend === "bearish") {
+            const closeQty = position.size;
+            console.log(
+              `[SELL] Bearish trend detected. Closing long position for ${refinedCoin}. Qty=${closeQty}`
+            );
+            const closeResult = await futuresMarketSell(symbol, closeQty);
+
+            let fillPrice = 0;
+            if (closeResult?.fills?.length) {
+              fillPrice = parseFloat(closeResult.fills[0].price) || 0;
+            }
+            const proceeds = closeQty * fillPrice;
+
+            const currentBal = await getUsdtBalance();
+            const updatedBal = currentBal + proceeds;
+            await updateUsdtBalance(updatedBal);
+
+             // Move to pastPositions before clearing current position
+             await moveToPastPositions(refinedCoin, {
+              ...position,
+              proceeds,
+              exitPrice: fillPrice,
+            });
+
+            await updatePosition(refinedCoin, {
+              side: "",
+              size: 0,
+              entryPrice: 0,
+              updatedAt: Date.now(),
+            });
+
+            const emailMsg = `EXIT_BUY for ${refinedCoin} due to bearish trend:
+            - Closed Long Qty: ${closeQty}
+            - Fill Price: ${fillPrice}
+            - Proceeds: ${proceeds}
+            - Updated USDT Balance: ${updatedBal}`;
+            await sendEmail(`EXIT_BUY - ${refinedCoin}`, emailMsg);
+
+            return {
+              status: "exited_buy_due_to_trend",
+              closeQty,
+              fillPrice,
+              proceeds,
+              updatedBal,
+            };
+          }
+        }
+
+        if (position.side && position.side !== "") {
+          const msg = `[ENTER_SELL] Already in a position: side=${position.side}. Skipping new SELL.`;
+          console.log(msg);
+          await sendEmail("Skipped ENTER_SELL", msg);
+          return { status: "skip_already_in_position" };
+        }
+
+        // Normal sell logic
+        if (usdtBal < 5) {
+          const msg = `[ENTER_SELL] Balance is only ${usdtBal}, too low for ${refinedCoin}.`;
+          console.log(msg);
+          await sendEmail("Low Balance - Skipped ENTER_SELL", msg);
+          return { status: "no_trade", reason: "low_balance", usdtBal };
+        }
+
+        const spendUsdt = usdtBal * 0.25;
+        const qty = await computeQty(spendUsdt, coin.split(".")[0]);
+        if (qty < 0.0001) {
+          const msg = `[ENTER_SELL] Computed quantity ${qty} is too small for ${refinedCoin}.`;
+          console.log(msg);
+          await sendEmail("Qty Too Small - Skipped ENTER_SELL", msg);
+          return { status: "skipped", reason: "qty_too_small" };
+        }
+
+        console.log(
+          `[ENTER_SELL] => symbol: ${symbol}, spend ~${spendUsdt}, qty=${qty}`
+        );
+        const sellResult = await futuresMarketSell(symbol, qty);
+
+        let fillPrice = 0;
+        if (sellResult?.fills?.length) {
+          fillPrice = parseFloat(sellResult.fills[0].price) || 0;
+        }
+        const costUsdt = qty * fillPrice;
+        const newBal = usdtBal - costUsdt;
+        await updateUsdtBalance(newBal);
+
+        await updatePosition(refinedCoin, {
+          side: "SELL",
+          size: qty,
+          entryPrice: fillPrice,
+          updatedAt: Date.now(),
+        });
+
+        const emailMsg = `ENTER_SELL executed for ${refinedCoin}:
+        - Quantity: ${qty}
+        - Fill Price: ${fillPrice}
+        - Margin Cost: ${costUsdt}
+        - Updated USDT Balance: ${newBal}`;
+        await sendEmail(`ENTER_SELL - ${refinedCoin}`, emailMsg);
+
+        return {
+          status: "success",
+          action: "ENTER_SELL",
+          qty,
+          fillPrice,
+          costUsdt,
+          newBal,
+        };
+      }
+
+      default:
+        console.log(`[ProcessSignals] Unknown type: ${type}`);
+        return {
+          status: "error",
+          message: `Unknown type: ${type}`,
+          refinedCoin,
+        };
+    }
+  } catch (err) {
+    console.error("[ProcessSignals] Error:", err);
+    throw err;
+  }
+};
+
+// -------------------------------------------------------------------------------------
+// 8) Worker Listener
+// -------------------------------------------------------------------------------------
+if (parentPort) {
+  ProcessSignals(workerData)
+    .then((result) => parentPort.postMessage({ result }))
+    .catch((error) => parentPort.postMessage({ error: error.message }));
+}
+
+
+ensure to not ommit any part of the code. and update the whole code while adding detailed comments

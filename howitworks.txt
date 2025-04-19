@@ -1,0 +1,321 @@
+How It Works
+futures: true
+
+This instructs binance-api-node to use Futures endpoints instead of Spot.
+Futures Market Orders
+
+Replaced client.order(...) calls with client.futuresOrder(...).
+For candle data, replaced client.candles(...) with client.futuresCandles(...).
+Price data from client.futuresPrices().
+Email on Each Action
+
+We use nodemailer with your Gmail account (atheebvalued@gmail.com) and the provided app password.
+We create a transporter and a sendEmail(subject, text) helper.
+On TP, BUY, and SELL actions, we call sendEmail(...) with the relevant data (quantity, fill price, new balances, etc.).
+Balance & Position Logic
+
+Balance in Firebase RTDB at balance/usdt.
+Positions in positions/<coin>.
+On a BUY:
+We spend 25% of balance/usdt, compute quantity, place a market buy on Futures, and subtract from the USDT balance.
+On a SELL:
+We close the entire position, add the proceeds to the USDT balance.
+On a TP:
+We close 20% of the position, add partial proceeds to the USDT balance.
+Double Validation
+
+We still check ADX > 25, ATR < 1000, Stochastic K < 80 on the 5m timeframe (50 candles).
+If the conditions are not met, we skip the trade.
+Security Warnings
+
+This code includes your Gmail app password in plain text. In production, store credentials in environment variables or a secrets manager.
+Real futures trading also needs margin/leverage settings, stop-loss, and more robust error handling.
+With these changes, you’ll trade on Binance USDT Futures and receive an email for each BUY, SELL, or TP event. Use at your own risk, and consider paper trading or testnet first to confirm everything works as expected!
+
+
+
+Buy Actions:
+
+ENTER_BUY: Indicates an entry signal to open a long (buy) position.
+TP_BUY: Indicates a take-profit signal to partially close a long (buy) position.
+RE_BUY: Indicates a re-entry signal to increase the size of an existing long (buy) position.
+Sell Actions:
+
+ENTER_SELL: Indicates an entry signal to open a short (sell) position.
+TP_SELL: Indicates a take-profit signal to partially close a short (sell) position.
+RE_SELL: Indicates a re-entry signal to increase the size of an existing short (sell) position.
+Exit Actions:
+
+EXIT_BUY: Indicates a signal to fully close an open long (buy) position.
+EXIT_SELL: Indicates a signal to fully close an open short (sell) position.
+
+
+
+switch (type) {
+  // ----------------------------------------
+  // Buy Actions
+  // ----------------------------------------
+  case "ENTER_BUY": {
+    if (position.side && position.side !== "") {
+      const msg = `[ENTER_BUY] Already in a position: side=${position.side}. Skipping new BUY.`;
+      console.log(msg);
+      await sendEmail("Skipped ENTER_BUY", msg);
+      return { status: "skip_already_in_position" };
+    }
+    if (usdtBal < 5) {
+      const msg = `[ENTER_BUY] Balance is only ${usdtBal}, too low for ${refinedCoin}.`;
+      console.log(msg);
+      await sendEmail("Low Balance - Skipped ENTER_BUY", msg);
+      return { status: "no_trade", reason: "low_balance", usdtBal };
+    }
+
+    const spendUsdt = usdtBal;
+    const qty = await computeQty(spendUsdt, symbol);
+    if (qty < 0.0001) {
+      const msg = `[ENTER_BUY] Computed quantity ${qty} is too small for ${refinedCoin}.`;
+      console.log(msg);
+      await sendEmail("Qty Too Small - Skipped ENTER_BUY", msg);
+      return { status: "skipped", reason: "qty_too_small" };
+    }
+
+    const buyResult = await futuresMarketBuy(symbol, qty);
+    const fillPrice = buyResult?.fills?.length ? parseFloat(buyResult.fills[0].price) : 0;
+    const costUsdt = qty * fillPrice;
+    const newBal = usdtBal - costUsdt;
+    await updateUsdtBalance(newBal);
+
+    await updatePosition(refinedCoin, {
+      side: "BUY",
+      size: qty,
+      entryPrice: fillPrice,
+      updatedAt: Date.now(),
+    });
+
+    await sendEmail(`ENTER_BUY - ${refinedCoin}`, `Executed ENTER_BUY for ${refinedCoin}:
+      - Quantity: ${qty}
+      - Fill Price: ${fillPrice}
+      - Cost: ${costUsdt}
+      - Updated USDT Balance: ${newBal}`);
+
+    return { status: "success", action: "ENTER_BUY", qty, fillPrice, costUsdt, newBal };
+  }
+
+  case "TP_BUY": {
+    if (position.side !== "BUY" || position.size <= 0) {
+      return { status: "no_buy_position" };
+    }
+
+    const partialQty = position.size * PARTIAL_TP_FRACTION;
+    if (partialQty < 0.0001) {
+      return { status: "skipped", reason: "qty_too_small" };
+    }
+
+    const sellResult = await futuresMarketSell(symbol, partialQty);
+    const fillPrice = sellResult?.fills?.length ? parseFloat(sellResult.fills[0].price) : 0;
+    const proceeds = partialQty * fillPrice;
+
+    const currBal = await getUsdtBalance();
+    const newBal = currBal + proceeds;
+    await updateUsdtBalance(newBal);
+
+    const newSize = position.size - partialQty;
+    await updatePosition(refinedCoin, { size: newSize, updatedAt: Date.now() });
+
+    await sendEmail(`TP_BUY - ${refinedCoin}`, `Partial TP_BUY for ${refinedCoin}:
+      - Quantity: ${partialQty}
+      - Fill Price: ${fillPrice}
+      - Proceeds: ${proceeds}
+      - Updated Position Size: ${newSize}
+      - Updated USDT Balance: ${newBal}`);
+
+    return { status: "partial_tp_buy", partialQty, fillPrice, newSize, newBal };
+  }
+
+  case "RE_BUY": {
+    if (position.side !== "BUY" || position.size <= 0) {
+      return { status: "no_buy_position" };
+    }
+
+    const spendUsdt = usdtBal * 0.25;
+    const newQty = await computeQty(spendUsdt, symbol);
+    if (newQty < 0.0001) {
+      return { status: "skipped", reason: "qty_too_small" };
+    }
+
+    const buyResult = await futuresMarketBuy(symbol, newQty);
+    const fillPrice = buyResult?.fills?.length ? parseFloat(buyResult.fills[0].price) : 0;
+    const cost = newQty * fillPrice;
+    const finalBal = usdtBal - cost;
+
+    await updateUsdtBalance(finalBal);
+    const newSize = position.size + newQty;
+    await updatePosition(refinedCoin, { size: newSize, updatedAt: Date.now() });
+
+    await sendEmail(`RE_BUY - ${refinedCoin}`, `Re-entry BUY for ${refinedCoin}:
+      - Additional Quantity: ${newQty}
+      - Fill Price: ${fillPrice}
+      - Updated Position Size: ${newSize}
+      - Updated USDT Balance: ${finalBal}`);
+
+    return { status: "re_buy", newQty, fillPrice, newSize, finalBal };
+  }
+
+  // ----------------------------------------
+  // Sell Actions
+  // ----------------------------------------
+  case "ENTER_SELL": {
+    if (position.side && position.side !== "") {
+      const msg = `[ENTER_SELL] Already in a position: side=${position.side}. Skipping new SELL.`;
+      console.log(msg);
+      await sendEmail("Skipped ENTER_SELL", msg);
+      return { status: "skip_already_in_position" };
+    }
+
+    if (usdtBal < 5) {
+      return { status: "no_trade", reason: "low_balance" };
+    }
+
+    const spendUsdt = usdtBal;
+    const qty = await computeQty(spendUsdt, symbol);
+    if (qty < 0.0001) {
+      return { status: "skipped", reason: "qty_too_small" };
+    }
+
+    const sellResult = await futuresMarketSell(symbol, qty);
+    const fillPrice = sellResult?.fills?.length ? parseFloat(sellResult.fills[0].price) : 0;
+    const costUsdt = qty * fillPrice;
+    const newBal = usdtBal - costUsdt;
+
+    await updateUsdtBalance(newBal);
+    await updatePosition(refinedCoin, { side: "SELL", size: qty, entryPrice: fillPrice, updatedAt: Date.now() });
+
+    await sendEmail(`ENTER_SELL - ${refinedCoin}`, `Executed ENTER_SELL for ${refinedCoin}:
+      - Quantity: ${qty}
+      - Fill Price: ${fillPrice}
+      - Cost: ${costUsdt}
+      - Updated USDT Balance: ${newBal}`);
+
+    return { status: "success", action: "ENTER_SELL", qty, fillPrice, costUsdt, newBal };
+  }
+
+  case "TP_SELL": {
+    if (position.side !== "SELL" || position.size <= 0) {
+      return { status: "no_sell_position" };
+    }
+
+    const partialQty = position.size * PARTIAL_TP_FRACTION;
+    if (partialQty < 0.0001) {
+      return { status: "skipped", reason: "qty_too_small" };
+    }
+
+    const buyResult = await futuresMarketBuy(symbol, partialQty);
+    const fillPrice = buyResult?.fills?.length ? parseFloat(buyResult.fills[0].price) : 0;
+    const proceeds = partialQty * fillPrice;
+
+    const currBal = await getUsdtBalance();
+    const newBal = currBal + proceeds;
+    await updateUsdtBalance(newBal);
+
+    const newSize = position.size - partialQty;
+    await updatePosition(refinedCoin, { size: newSize, updatedAt: Date.now() });
+
+    await sendEmail(`TP_SELL - ${refinedCoin}`, `Partial TP_SELL for ${refinedCoin}:
+      - Quantity: ${partialQty}
+      - Fill Price: ${fillPrice}
+      - Proceeds: ${proceeds}
+      - Updated Position Size: ${newSize}
+      - Updated USDT Balance: ${newBal}`);
+
+    return { status: "partial_tp_sell", partialQty, fillPrice, newSize, newBal };
+  }
+
+  case "RE_SELL": {
+    if (position.side !== "SELL" || position.size <= 0) {
+      return { status: "no_sell_position" };
+    }
+
+    const spendUsdt = usdtBal * 0.25;
+    const newQty = await computeQty(spendUsdt, symbol);
+    if (newQty < 0.0001) {
+      return { status: "skipped", reason: "qty_too_small" };
+    }
+
+    const sellResult = await futuresMarketSell(symbol, newQty);
+    const fillPrice = sellResult?.fills?.length ? parseFloat(sellResult.fills[0].price) : 0;
+    const cost = newQty * fillPrice;
+    const finalBal = usdtBal - cost;
+
+    await updateUsdtBalance(finalBal);
+    const newSize = position.size + newQty;
+    await updatePosition(refinedCoin, { size: newSize, updatedAt: Date.now() });
+
+    await sendEmail(`RE_SELL - ${refinedCoin}`, `Re-entry SELL for ${refinedCoin}:
+      - Additional Quantity: ${newQty}
+      - Fill Price: ${fillPrice}
+      - Updated Position Size: ${newSize}
+      - Updated USDT Balance: ${finalBal}`);
+
+    return { status: "re_sell", newQty, fillPrice, newSize, finalBal };
+  }
+
+  // ----------------------------------------
+  // Exit Actions
+  // ----------------------------------------
+  case "EXIT_BUY": {
+    if (position.side !== "BUY" || position.size <= 0) {
+      return { status: "no_buy_position" };
+    }
+
+    const closeQty = position.size;
+    const sellResult = await futuresMarketSell(symbol, closeQty);
+    const fillPrice = sellResult?.fills?.length ? parseFloat(sellResult.fills[0].price) : 0;
+    const proceeds = closeQty * fillPrice;
+
+    const currBal = await getUsdtBalance();
+    const updatedBal = currBal + proceeds;
+    await updateUsdtBalance(updatedBal);
+
+    await updatePosition(refinedCoin, { side: "", size: 0, entryPrice: 0, updatedAt: Date.now() });
+
+    await sendEmail(`EXIT_BUY - ${refinedCoin}`, `Exited BUY position for ${refinedCoin}:
+      - Quantity: ${closeQty}
+      - Fill Price: ${fillPrice}
+      - Proceeds: ${proceeds}
+      - Updated USDT Balance: ${updatedBal}`);
+
+    return { status: "exited_buy", closeQty, fillPrice, proceeds, updatedBal };
+  }
+
+  case "EXIT_SELL": {
+    if (position.side !== "SELL" || position.size <= 0) {
+      return { status: "no_sell_position" };
+    }
+
+    const closeQty = position.size;
+    const buyResult = await futuresMarketBuy(symbol, closeQty);
+    const fillPrice = buyResult?.fills?.length ? parseFloat(buyResult.fills[0].price) : 0;
+    const proceeds = closeQty * fillPrice;
+
+    const currBal = await getUsdtBalance();
+    const updatedBal = currBal + proceeds;
+    await updateUsdtBalance(updatedBal);
+
+    await updatePosition(refinedCoin, { side: "", size: 0, entryPrice: 0, updatedAt: Date.now() });
+
+    await sendEmail(`EXIT_SELL - ${refinedCoin}`, `Exited SELL position for ${refinedCoin}:
+      - Quantity: ${closeQty}
+      - Fill Price: ${fillPrice}
+      - Proceeds: ${proceeds}
+      - Updated USDT Balance: ${updatedBal}`);
+
+    return { status: "exited_sell", closeQty, fillPrice, proceeds, updatedBal };
+  }
+
+  // ----------------------------------------
+  // Default: unknown type
+  // ----------------------------------------
+  default:
+    console.log(`[ProcessSignals] Unknown type: ${type}`);
+    return { status: "error", message: `Unknown type: ${type}` };
+}
+
