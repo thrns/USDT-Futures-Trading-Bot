@@ -118,6 +118,41 @@ async function futuresMarketSell(symbol, quantity) {
   });
 }
 
+async function reversePosition(symbol, position, nextSide, balance) {
+  const closeSide = nextSide === 'BUY' ? 'SELL' : 'BUY';
+  const closeOrder = closeSide === 'BUY'
+    ? await futuresMarketBuy(symbol, position.size)
+    : await futuresMarketSell(symbol, position.size);
+  const closePrice = parseFloat(closeOrder?.fills?.[0]?.price || 0);
+  const proceeds = position.size * closePrice;
+  const realizedPnL = position.side === 'BUY'
+    ? (closePrice - position.entryPrice) * position.size
+    : (position.entryPrice - closePrice) * position.size;
+
+  await updateUsdtBalance(balance + proceeds);
+  await moveToPastPositions(symbol, {
+    ...position,
+    exitPrice: closePrice,
+    proceeds,
+    realizedPnL,
+  });
+
+  const availableBalance = balance + proceeds;
+  const quantity = await computeQty(availableBalance * 0.25, symbol);
+  if (quantity <= 0) {
+    return { status: 'skipped', reason: 'qty_too_small', realizedPnL };
+  }
+
+  const openOrder = nextSide === 'BUY'
+    ? await futuresMarketBuy(symbol, quantity)
+    : await futuresMarketSell(symbol, quantity);
+  const entryPrice = parseFloat(openOrder?.fills?.[0]?.price || 0);
+  const cost = quantity * entryPrice;
+  await storeOpenPosition(symbol, nextSide, quantity, entryPrice, availableBalance - cost);
+  await sendEmail(`Reversal to ${nextSide} - ${symbol}`, `Closed ${position.side} and opened ${nextSide}: quantity=${quantity}`);
+  return { status: 'success', action: `reversed_to_${nextSide.toLowerCase()}`, quantity, entryPrice, realizedPnL };
+}
+
 const ProcessSignals = async (reqData) => {
   const { coin, type } = reqData || {};
   if (!coin || !type) {
@@ -134,6 +169,11 @@ const ProcessSignals = async (reqData) => {
     const message = `Balance is only ${balance}, too low for ${symbol}.`;
     await sendEmail('Low Balance - Skipped Trade', message);
     return { status: 'no_trade', reason: 'low_balance', symbol };
+  }
+
+  const requestedSide = type === 'buy' ? 'BUY' : 'SELL';
+  if (position && position.side && position.side !== requestedSide) {
+    return reversePosition(symbol, position, requestedSide, balance);
   }
 
   if (position && position.side) {
