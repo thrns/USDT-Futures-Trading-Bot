@@ -55,12 +55,23 @@ async function storeOpenPosition(symbol, side, size, entryPrice, balance) {
 }
 
 async function moveToPastPositions(symbol, position) {
-  const timestamp = Date.now();
-  await update(ref(ATRealDb, `/past_positions/${symbol}/${timestamp}`), {
-    ...position,
-    closedAt: timestamp,
-  });
-  await remove(ref(ATRealDb, `/positions/${symbol}`));
+  const pastPositionsRef = ref(
+    ATRealDb,
+    `atheeb/pastPositions/${symbol}/${Date.now()}`,
+  );
+  const positionRef = ref(ATRealDb, `/positions/${symbol}`);
+
+  try {
+    await update(pastPositionsRef, {
+      ...position,
+      closedAt: Date.now(),
+    });
+    await remove(positionRef);
+    console.log(`[moveToPastPositions] Moved ${symbol} position to pastPositions.`);
+  } catch (error) {
+    console.error(`[moveToPastPositions] Error for ${symbol}: ${error.message}`);
+    throw error;
+  }
 }
 
 function getSymbol(coin) {
