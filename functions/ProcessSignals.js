@@ -112,21 +112,36 @@ async function computeQty(spendUsdt, symbol) {
 }
 
 async function futuresMarketBuy(symbol, quantity) {
-  return client.submitNewOrder({
+  const order = await client.submitNewOrder({
     symbol,
     side: 'BUY',
     type: 'MARKET',
     quantity: String(quantity),
   });
+  return waitForOrderExecution(symbol, order.orderId);
 }
 
 async function futuresMarketSell(symbol, quantity) {
-  return client.submitNewOrder({
+  const order = await client.submitNewOrder({
     symbol,
     side: 'SELL',
     type: 'MARKET',
     quantity: String(quantity),
   });
+  return waitForOrderExecution(symbol, order.orderId);
+}
+
+async function waitForOrderExecution(symbol, orderId, maxRetries = 5, delayMs = 1000) {
+  let retries = 0;
+  while (retries < maxRetries) {
+    const order = await client.getOrder({ symbol, orderId });
+    if (order.status === 'FILLED') return order;
+
+    console.log('[waitForOrderExecution] Order not filled yet. Retrying...');
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    retries += 1;
+  }
+  throw new Error(`Order ${orderId} not filled after ${maxRetries} retries.`);
 }
 
 async function reversePosition(symbol, position, nextSide, balance) {
