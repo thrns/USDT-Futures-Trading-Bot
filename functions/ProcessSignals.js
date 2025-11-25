@@ -7,6 +7,8 @@ import { get, ref, update, remove } from 'firebase/database';
 
 dotenv.config();
 
+const LEVERAGE = 30;
+
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: { user: '', pass: '' },
@@ -44,11 +46,13 @@ export async function updateUsdtBalance(newBalance) {
   await update(ref(ATRealDb, '/balance'), { usdt: newBalance });
 }
 
-async function storeOpenPosition(symbol, side, size, entryPrice, balance) {
+async function storeOpenPosition(symbol, side, size, entryPrice, balance, capitalAllocated) {
   await updatePosition(symbol, {
     side,
     size,
     entryPrice,
+    leverage: LEVERAGE,
+    capitalAllocated,
     updatedAt: Date.now(),
   });
   await updateUsdtBalance(balance);
@@ -104,7 +108,8 @@ async function computeQty(spendUsdt, symbol) {
   if (!price || price <= 0) return 0;
 
   const { quantityPrecision, minQty, stepSize } = await getSymbolPrecision(symbol);
-  const rawQty = spendUsdt / price;
+  const effectiveUsdt = spendUsdt * LEVERAGE;
+  const rawQty = effectiveUsdt / price;
   const adjustedQty = parseFloat(
     (Math.floor(rawQty / stepSize) * stepSize).toFixed(quantityPrecision),
   );
@@ -173,8 +178,8 @@ async function reversePosition(symbol, position, nextSide, balance) {
     ? await futuresMarketBuy(symbol, quantity)
     : await futuresMarketSell(symbol, quantity);
   const entryPrice = parseFloat(openOrder?.fills?.[0]?.price || 0);
-  const cost = quantity * entryPrice;
-  await storeOpenPosition(symbol, nextSide, quantity, entryPrice, availableBalance - cost);
+  const cost = (quantity * entryPrice) / LEVERAGE;
+  await storeOpenPosition(symbol, nextSide, quantity, entryPrice, availableBalance - cost, cost);
   await sendEmail(`Reversal to ${nextSide} - ${symbol}`, `Closed ${position.side} and opened ${nextSide}: quantity=${quantity}`);
   return { status: 'success', action: `reversed_to_${nextSide.toLowerCase()}`, quantity, entryPrice, realizedPnL };
 }
@@ -216,11 +221,11 @@ const ProcessSignals = async (reqData) => {
     ? await futuresMarketBuy(symbol, quantity)
     : await futuresMarketSell(symbol, quantity);
   const fillPrice = parseFloat(order?.fills?.[0]?.price || 0);
-  const cost = quantity * fillPrice;
+  const cost = (quantity * fillPrice) / LEVERAGE;
   const nextBalance = balance - cost;
   const side = type === 'buy' ? 'BUY' : 'SELL';
 
-  await storeOpenPosition(symbol, side, quantity, fillPrice, nextBalance);
+  await storeOpenPosition(symbol, side, quantity, fillPrice, nextBalance, cost);
   await sendEmail(`${type.toUpperCase()} - ${symbol}`, `Executed ${type}: quantity=${quantity}, fillPrice=${fillPrice}`);
   return { status: 'success', action: type, quantity, fillPrice, cost, nextBalance };
 };
