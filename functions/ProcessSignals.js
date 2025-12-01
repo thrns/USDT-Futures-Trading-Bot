@@ -59,16 +59,17 @@ async function storeOpenPosition(symbol, side, size, entryPrice, balance, capita
 }
 
 async function moveToPastPositions(symbol, position) {
+  const closedAt = Date.now();
   const pastPositionsRef = ref(
     ATRealDb,
-    `atheeb/pastPositions/${symbol}/${Date.now()}`,
+    `atheeb/pastPositions/${symbol}/${closedAt}`,
   );
   const positionRef = ref(ATRealDb, `/positions/${symbol}`);
 
   try {
     await update(pastPositionsRef, {
       ...position,
-      closedAt: Date.now(),
+      closedAt,
     });
     await remove(positionRef);
     console.log(`[moveToPastPositions] Moved ${symbol} position to pastPositions.`);
