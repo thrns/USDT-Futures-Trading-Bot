@@ -97,10 +97,17 @@ async function getSymbolPrecision(symbol) {
   if (!symbolInfo) throw new Error(`Symbol ${symbol} not found in futures exchange info`);
 
   const lotSize = symbolInfo.filters.find((item) => item.filterType === 'LOT_SIZE');
+  const minNotionalFilter = symbolInfo.filters.find(
+    (item) => item.filterType === 'MIN_NOTIONAL',
+  );
+  if (!lotSize || !minNotionalFilter) {
+    throw new Error(`Required filters missing for ${symbol}`);
+  }
   return {
     quantityPrecision: symbolInfo.quantityPrecision,
     minQty: parseFloat(lotSize.minQty),
     stepSize: parseFloat(lotSize.stepSize),
+    minNotional: parseFloat(minNotionalFilter.notional),
   };
 }
 
@@ -108,13 +115,14 @@ async function computeQty(spendUsdt, symbol) {
   const price = await getLastPrice(symbol);
   if (!price || price <= 0) return 0;
 
-  const { quantityPrecision, minQty, stepSize } = await getSymbolPrecision(symbol);
+  const { quantityPrecision, minQty, stepSize, minNotional } = await getSymbolPrecision(symbol);
   const effectiveUsdt = spendUsdt * LEVERAGE;
   const rawQty = effectiveUsdt / price;
   const adjustedQty = parseFloat(
     (Math.floor(rawQty / stepSize) * stepSize).toFixed(quantityPrecision),
   );
-  return adjustedQty >= minQty ? adjustedQty : 0;
+  const notional = (adjustedQty * price) / LEVERAGE;
+  return adjustedQty >= minQty && notional >= minNotional ? adjustedQty : 0;
 }
 
 async function futuresMarketBuy(symbol, quantity) {
