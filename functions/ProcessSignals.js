@@ -166,6 +166,20 @@ function getAverageFillPrice(order) {
   return parseFloat(order?.avgPrice || order?.fills?.[0]?.price || 0);
 }
 
+async function openPosition(symbol, side, balance) {
+  const quantity = await computeQty(balance * 0.25, symbol);
+  if (quantity <= 0) return null;
+
+  const order = side === 'BUY'
+    ? await futuresMarketBuy(symbol, quantity)
+    : await futuresMarketSell(symbol, quantity);
+  const executedQuantity = getExecutedQuantity(order, quantity);
+  const entryPrice = getAverageFillPrice(order);
+  const cost = (executedQuantity * entryPrice) / LEVERAGE;
+  await storeOpenPosition(symbol, side, executedQuantity, entryPrice, balance - cost, cost);
+  return { quantity: executedQuantity, entryPrice, cost, balance: balance - cost };
+}
+
 async function reversePosition(symbol, position, nextSide, balance) {
   const closeSide = nextSide === 'BUY' ? 'SELL' : 'BUY';
   const closeOrder = closeSide === 'BUY'
@@ -187,20 +201,13 @@ async function reversePosition(symbol, position, nextSide, balance) {
   });
 
   const availableBalance = balance + proceeds;
-  const quantity = await computeQty(availableBalance * 0.25, symbol);
-  if (quantity <= 0) {
+  const opened = await openPosition(symbol, nextSide, availableBalance);
+  if (!opened) {
     return { status: 'skipped', reason: 'qty_too_small', realizedPnL };
   }
 
-  const openOrder = nextSide === 'BUY'
-    ? await futuresMarketBuy(symbol, quantity)
-    : await futuresMarketSell(symbol, quantity);
-  const executedQuantity = getExecutedQuantity(openOrder, quantity);
-  const entryPrice = getAverageFillPrice(openOrder);
-  const cost = (executedQuantity * entryPrice) / LEVERAGE;
-  await storeOpenPosition(symbol, nextSide, executedQuantity, entryPrice, availableBalance - cost, cost);
-  await sendEmail(`Reversal to ${nextSide} - ${symbol}`, `Closed ${position.side} and opened ${nextSide}: quantity=${executedQuantity}`);
-  return { status: 'success', action: `reversed_to_${nextSide.toLowerCase()}`, quantity: executedQuantity, entryPrice, realizedPnL };
+  await sendEmail(`Reversal to ${nextSide} - ${symbol}`, `Closed ${position.side} and opened ${nextSide}: quantity=${opened.quantity}`);
+  return { status: 'success', action: `reversed_to_${nextSide.toLowerCase()}`, ...opened, realizedPnL };
 }
 
 const ProcessSignals = async (reqData) => {
@@ -230,24 +237,14 @@ const ProcessSignals = async (reqData) => {
     return { status: 'skip_already_in_position', symbol, side: position.side };
   }
 
-  const quantity = await computeQty(balance * 0.25, symbol);
-  if (quantity <= 0) {
+  const opened = await openPosition(symbol, requestedSide, balance);
+  if (!opened) {
     await sendEmail('Qty Too Small - Skipped Trade', `No valid quantity for ${symbol}.`);
     return { status: 'skipped', reason: 'qty_too_small', symbol };
   }
 
-  const order = type === 'buy'
-    ? await futuresMarketBuy(symbol, quantity)
-    : await futuresMarketSell(symbol, quantity);
-  const executedQuantity = getExecutedQuantity(order, quantity);
-  const fillPrice = getAverageFillPrice(order);
-  const cost = (executedQuantity * fillPrice) / LEVERAGE;
-  const nextBalance = balance - cost;
-  const side = type === 'buy' ? 'BUY' : 'SELL';
-
-  await storeOpenPosition(symbol, side, executedQuantity, fillPrice, nextBalance, cost);
-  await sendEmail(`${type.toUpperCase()} - ${symbol}`, `Executed ${type}: quantity=${executedQuantity}, fillPrice=${fillPrice}`);
-  return { status: 'success', action: type, quantity: executedQuantity, fillPrice, cost, nextBalance };
+  await sendEmail(`${type.toUpperCase()} - ${symbol}`, `Executed ${type}: quantity=${opened.quantity}, fillPrice=${opened.entryPrice}`);
+  return { status: 'success', action: type, ...opened };
 };
 
 if (parentPort) {
