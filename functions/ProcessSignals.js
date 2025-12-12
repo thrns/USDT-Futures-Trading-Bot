@@ -126,23 +126,33 @@ async function computeQty(spendUsdt, symbol) {
 }
 
 async function futuresMarketBuy(symbol, quantity) {
-  const order = await client.submitNewOrder({
-    symbol,
-    side: 'BUY',
-    type: 'MARKET',
-    quantity: String(quantity),
-  });
-  return waitForOrderExecution(symbol, order.orderId);
+  try {
+    const order = await client.submitNewOrder({
+      symbol,
+      side: 'BUY',
+      type: 'MARKET',
+      quantity: String(quantity),
+    });
+    return waitForOrderExecution(symbol, order.orderId);
+  } catch (error) {
+    console.error(`Error placing market buy order: ${error.message}`);
+    throw error;
+  }
 }
 
 async function futuresMarketSell(symbol, quantity) {
-  const order = await client.submitNewOrder({
-    symbol,
-    side: 'SELL',
-    type: 'MARKET',
-    quantity: String(quantity),
-  });
-  return waitForOrderExecution(symbol, order.orderId);
+  try {
+    const order = await client.submitNewOrder({
+      symbol,
+      side: 'SELL',
+      type: 'MARKET',
+      quantity: String(quantity),
+    });
+    return waitForOrderExecution(symbol, order.orderId);
+  } catch (error) {
+    console.error(`Error placing market sell order: ${error.message}`);
+    throw error;
+  }
 }
 
 async function waitForOrderExecution(symbol, orderId, maxRetries = 5, delayMs = 1000) {
