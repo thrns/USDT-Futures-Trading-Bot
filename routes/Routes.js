@@ -1,6 +1,7 @@
 import express from 'express';
 import { Worker } from 'worker_threads';
 
+
 const router = express.Router();
 
 const runWorker = (workerFile, data) => {
@@ -24,20 +25,25 @@ const runWorker = (workerFile, data) => {
   });
 };
 
+// Test route
 router.get('/test', (req, res) => {
   res.send('Test route "...API/TEST" is working!');
 });
 
+
+
+// Route to send email reminder
 router.post('/webhook', async (req, res) => {
   try {
-    const result = await runWorker('./functions/ProcessSignals.js', req.body);
-    console.log('Worker result:', result);
+
+    const result = await runWorker("./functions/ProcessSignals.js", req.body);
+    console.log("Worker result:", result);
     res.status(200).json({ success: true, result });
   } catch (error) {
-    console.error('Error in ProcessSignals:', error.message);
+    console.error("Error in ProcessSignals:", error.message);
     res.status(500).json({
       success: false,
-      error: error.message || 'An error occurred while processing the webhook.',
+      error: error.message || "An error occurred while processing the webhook.",
     });
   }
 });
